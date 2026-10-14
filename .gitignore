@@ -1,0 +1,22 @@
+# Ambientes Virtuais Python
+venv/
+env/
+
+# Pastas de Compilação do PyInstaller / Flet
+dist/
+build/
+*.spec
+
+# Logs e Relatórios Locais
+logs/
+*_FALHAS.csv
+checkpoint.json
+
+# Arquivos temporários do Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Arquivos de sistema operacional
+.DS_Store
+Thumbs.db

@@ -1,0 +1,5 @@
+flet==0.21.2
+pandas==2.2.1
+aiohttp==3.9.3
+pydantic==2.6.4
+python-dotenv==1.0.1

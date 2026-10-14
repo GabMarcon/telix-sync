@@ -1,0 +1,188 @@
+import os
+import json
+import time
+import asyncio
+import aiohttp
+from datetime import datetime
+from src.config import CHECKPOINT_FILE
+from src.core.logger import get_logger
+
+log = get_logger()
+
+
+# ==========================================
+# FUNÇÕES AUXILIARES INTERNAS
+# ==========================================
+def _get_checkpoint(filepath: str) -> int:
+    try:
+        with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f).get(os.path.abspath(filepath), 0)
+    except Exception:
+        return 0
+
+
+def _manage_checkpoint(filepath: str, last_idx: int = None, clear: bool = False):
+    checkpoints = {}
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+                checkpoints = json.load(f)
+        except Exception:
+            pass
+
+    abs_path = os.path.abspath(filepath)
+    if clear:
+        checkpoints.pop(abs_path, None)
+    elif last_idx is not None:
+        checkpoints[abs_path] = last_idx
+
+    with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(checkpoints, f)
+
+
+def _write_to_dlq(original_filepath: str, payload: dict, error_msg: str):
+    base_name = os.path.splitext(os.path.basename(original_filepath))[0]
+    dlq_file = os.path.join(os.path.dirname(original_filepath), f"{base_name}_FALHAS.csv")
+    exists = os.path.exists(dlq_file)
+
+    with open(dlq_file, 'a', encoding='utf-8') as f:
+        if not exists:
+            f.write("PAYLOAD_JSON;MOTIVO_ERRO\n")
+        payload_str = json.dumps(payload).replace(',', '|')
+        f.write(f"{payload_str};{error_msg}\n")
+
+
+def _generate_report(file_path: str, processed: int, success: int, errors: int, start_time: float, host: str) -> str:
+    server_id = host.replace("https://", "").replace("http://", "").split(".")[0].split(":")[0]
+    data_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    prefix = "erros" if errors > 0 else "relatorio"
+    report_name = f"{prefix}_{server_id}_{data_str}.txt"
+
+    os.makedirs("logs", exist_ok=True)
+    report_path = os.path.join("logs", report_name)
+
+    elapsed = int(time.time() - start_time)
+
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 40 + "\nRELATÓRIO DE REINSERÇÃO TELIX\n" + "=" * 40 + "\n\n")
+        f.write(f"Arquivo Original: {os.path.basename(file_path)}\n")
+        f.write(f"Servidor Alvo: {host}\n")
+        f.write(f"Data de Conclusão: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+        f.write(f"Tempo Total: {elapsed} segundos\n")
+        f.write(f"Registros Processados: {processed}\n")
+        f.write(f"Sucessos (Telix OK): {success}\n")
+        f.write(f"Falhas (DLQ): {errors}\n")
+    return report_path
+
+
+# ==========================================
+# MOTOR PRINCIPAL INTELIGENTE (ADAPTATIVE EPS)
+# ==========================================
+async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=None, progress_callback=None,
+                                 log_callback=None):
+    url = f"{host.strip().rstrip('/')}/api/v1/{token}/telemetry"
+    start_index = _get_checkpoint(file_path)
+    total_payloads = len(payloads)
+
+    if start_index >= total_payloads:
+        if log_callback: log_callback("Arquivo já processado na totalidade. Ignorando injeção.")
+        return
+
+    # 1. Ajuste da Marcha Inicial (Mais conservador para não sobrecarregar a Rule Chain)
+    if total_payloads < 1500:
+        current_eps = 20.0
+    elif total_payloads < 5000:
+        current_eps = 15.0
+    else:
+        current_eps = 8.0
+
+    if log_callback:
+        log_callback(f"[{token}] Carga de {total_payloads} pacotes. EPS Inicial: {current_eps} req/seg.")
+
+    sucessos = 0
+    erros = 0
+    consecutive_success = 0
+    start_time = time.time()
+
+    # 2. Limitadores mais rigorosos
+    MAX_EPS = 25.0
+    MIN_EPS = 2.0
+
+    # 3. Aumentado o Timeout de 10s para 30s (Dá tempo da Rule Chain salvar no banco)
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for current_idx in range(start_index, total_payloads):
+
+            if cancel_token and cancel_token.cancelled:
+                if log_callback: log_callback("⚠️ Injeção abortada pelo usuário. Checkpoint salvo.")
+                break
+
+            cycle_start = time.time()
+            payload = payloads[current_idx]
+
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    async with session.post(url, json=payload) as response:
+                        if response.status == 200:
+                            sucessos += 1
+                            consecutive_success += 1
+
+                            if consecutive_success >= 150 and current_eps < MAX_EPS:
+                                current_eps = min(MAX_EPS, current_eps + 2.0)
+                                consecutive_success = 0
+                                if log_callback: log_callback(f"Servidor estável. Acelerando para {current_eps} EPS.")
+
+                            break
+
+                        elif response.status in [429, 500, 502, 503, 504]:
+                            current_eps = max(MIN_EPS, current_eps * 0.5)
+                            consecutive_success = 0
+
+                            if log_callback and attempt == 0:
+                                log_callback(
+                                    f"⚠️ Rule Chain congestionada (HTTP {response.status}). Reduzindo para {current_eps} EPS.")
+
+                            if attempt < retries - 1:
+                                # 4. Pausa de Desafogo: 5 segundos para a fila do ThingsBoard esvaziar
+                                await asyncio.sleep(5.0)
+                            else:
+                                _write_to_dlq(file_path, payload, f"HTTP_{response.status}")
+                                erros += 1
+
+                        else:
+                            _write_to_dlq(file_path, payload, f"HTTP_{response.status}")
+                            erros += 1
+                            break
+
+                except Exception as ex:
+                    current_eps = max(MIN_EPS, current_eps * 0.5)
+                    consecutive_success = 0
+
+                    if log_callback and attempt == 0:
+                        log_callback(f"⚠️ Falha na rede/Timeout. Reduzindo para {current_eps} EPS.")
+
+                    if attempt == retries - 1:
+                        _write_to_dlq(file_path, payload, "TIMEOUT_OU_REDE")
+                        erros += 1
+                    else:
+                        await asyncio.sleep(5.0)
+
+            if progress_callback:
+                progress_callback((current_idx + 1), total_payloads)
+
+            if (current_idx + 1) % 1000 == 0:
+                _manage_checkpoint(file_path, current_idx + 1)
+
+            elapsed = time.time() - cycle_start
+            min_cycle_time = 1.0 / current_eps
+            if elapsed < min_cycle_time:
+                await asyncio.sleep(min_cycle_time - elapsed)
+
+    if not (cancel_token and cancel_token.cancelled):
+        _manage_checkpoint(file_path, clear=True)
+        report_path = _generate_report(file_path, (sucessos + erros), sucessos, erros, start_time, host)
+        if log_callback:
+            log_callback(f"Injeção finalizada! Relatório salvo em: {report_path}")
