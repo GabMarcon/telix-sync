@@ -42,13 +42,16 @@ def _manage_checkpoint(filepath: str, last_idx: int = None, clear: bool = False)
 
 def _write_to_dlq(original_filepath: str, payload: dict, error_msg: str):
     base_name = os.path.splitext(os.path.basename(original_filepath))[0]
+    if base_name.upper().endswith("_FALHAS"):
+        base_name = base_name[:-7]
+
     dlq_file = os.path.join(os.path.dirname(original_filepath), f"{base_name}_FALHAS.csv")
     exists = os.path.exists(dlq_file)
 
     with open(dlq_file, 'a', encoding='utf-8') as f:
         if not exists:
             f.write("PAYLOAD_JSON;MOTIVO_ERRO\n")
-        payload_str = json.dumps(payload).replace(',', '|')
+        payload_str = json.dumps(payload, ensure_ascii=False)
         f.write(f"{payload_str};{error_msg}\n")
 
 
@@ -76,6 +79,22 @@ def _generate_report(file_path: str, processed: int, success: int, errors: int, 
     return report_path
 
 
+def _format_eta(seconds: float) -> str:
+    """Formata segundos restantes para um formato legível (ex: ~2m 15s)."""
+    if seconds is None or seconds < 0 or seconds > 86400:
+        return "Calculando..."
+    secs = int(seconds)
+    if secs < 60:
+        return f"~{secs}s"
+    mins = secs // 60
+    rem_secs = secs % 60
+    if mins < 60:
+        return f"~{mins}m {rem_secs}s"
+    hours = mins // 60
+    rem_mins = mins % 60
+    return f"~{hours}h {rem_mins}m"
+
+
 # ==========================================
 # MOTOR PRINCIPAL INTELIGENTE (ADAPTATIVE EPS)
 # ==========================================
@@ -86,10 +105,11 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
     total_payloads = len(payloads)
 
     if start_index >= total_payloads:
-        if log_callback: log_callback("Arquivo já processado na totalidade. Ignorando injeção.")
+        if log_callback:
+            log_callback("Arquivo já processado na totalidade. Ignorando injeção.")
         return
 
-    # 1. Ajuste da Marcha Inicial (Mais conservador para não sobrecarregar a Rule Chain)
+    # Ajuste da Marcha Inicial
     if total_payloads < 1500:
         current_eps = 20.0
     elif total_payloads < 5000:
@@ -105,24 +125,23 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
     consecutive_success = 0
     start_time = time.time()
 
-    # 2. Limitadores mais rigorosos
     MAX_EPS = 25.0
     MIN_EPS = 2.0
-
-    # 3. Aumentado o Timeout de 10s para 30s (Dá tempo da Rule Chain salvar no banco)
     timeout = aiohttp.ClientTimeout(total=30)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for current_idx in range(start_index, total_payloads):
 
             if cancel_token and cancel_token.cancelled:
-                if log_callback: log_callback("⚠️ Injeção abortada pelo usuário. Checkpoint salvo.")
+                if log_callback:
+                    log_callback("⚠️ Injeção abortada pelo usuário. Checkpoint salvo.")
                 break
 
             cycle_start = time.time()
             payload = payloads[current_idx]
 
             retries = 3
+            abort_file = False
             for attempt in range(retries):
                 try:
                     async with session.post(url, json=payload) as response:
@@ -133,8 +152,20 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
                             if consecutive_success >= 150 and current_eps < MAX_EPS:
                                 current_eps = min(MAX_EPS, current_eps + 2.0)
                                 consecutive_success = 0
-                                if log_callback: log_callback(f"Servidor estável. Acelerando para {current_eps} EPS.")
+                                if log_callback:
+                                    log_callback(f"Servidor estável. Acelerando para {current_eps} EPS.")
 
+                            break
+
+                        # Se retornar 401 (Unauthorized) ou 404 (Not Found), o token está errado no ThingsBoard
+                        elif response.status in [401, 404]:
+                            err_msg = f"HTTP_{response.status} (Token inválido ou dispositivo não cadastrado)"
+                            if log_callback:
+                                log_callback(
+                                    f"❌ ERRO CRÍTICO: Servidor recusou o Token '{token}' ({err_msg}). Abortando arquivo.")
+                            _write_to_dlq(file_path, payload, err_msg)
+                            erros += 1
+                            abort_file = True
                             break
 
                         elif response.status in [429, 500, 502, 503, 504]:
@@ -146,7 +177,6 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
                                     f"⚠️ Rule Chain congestionada (HTTP {response.status}). Reduzindo para {current_eps} EPS.")
 
                             if attempt < retries - 1:
-                                # 4. Pausa de Desafogo: 5 segundos para a fila do ThingsBoard esvaziar
                                 await asyncio.sleep(5.0)
                             else:
                                 _write_to_dlq(file_path, payload, f"HTTP_{response.status}")
@@ -157,7 +187,7 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
                             erros += 1
                             break
 
-                except Exception as ex:
+                except Exception:
                     current_eps = max(MIN_EPS, current_eps * 0.5)
                     consecutive_success = 0
 
@@ -170,8 +200,21 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
                     else:
                         await asyncio.sleep(5.0)
 
-            if progress_callback:
-                progress_callback((current_idx + 1), total_payloads)
+            if abort_file:
+                break
+
+            # Cálculo de ETA para a interface
+            if progress_callback and ((current_idx + 1) % 10 == 0 or (current_idx + 1) == total_payloads):
+                processed_count = (current_idx + 1) - start_index
+                elapsed_total = time.time() - start_time
+                if processed_count > 0 and elapsed_total > 0:
+                    avg_speed = processed_count / elapsed_total
+                    remaining_items = total_payloads - (current_idx + 1)
+                    eta_seconds = remaining_items / avg_speed if avg_speed > 0 else 0
+                    eta_str = _format_eta(eta_seconds)
+                else:
+                    eta_str = "Calculando..."
+                progress_callback((current_idx + 1), total_payloads, current_eps, eta_str)
 
             if (current_idx + 1) % 1000 == 0:
                 _manage_checkpoint(file_path, current_idx + 1)
