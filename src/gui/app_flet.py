@@ -4,13 +4,13 @@ import asyncio
 import aiohttp
 import flet as ft
 from datetime import datetime
-from src.config import COMM_WIFI, COMM_NBIOT
+from src.config import COMM_WIFI, COMM_NBIOT, COMM_LORA
 from src.core.etl_processor import process_data, preview_data, guess_serial_from_filename
 from src.core.tb_injector import inject_telemetry_async
 from src.core.logger import get_logger
 
 # Definição global da versão do software
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 log = get_logger()
 
@@ -29,15 +29,25 @@ def count_file_lines(filepath):
 
 
 def detect_file_source(filepath):
+    """
+    Identifica automaticamente a origem do ficheiro pelo nome ou pela estrutura do cabeçalho:
+    - 'dlq': Ficheiros terminados em _FALHAS.csv ou iniciados por PAYLOAD_JSON
+    - 'sirius': Ficheiros extraídos diretamente do datalogger Sirius (cabeçalho contém Datetime / Sens1 Data1)
+    - 'telix': Ficheiros exportados da plataforma Telix (separados por ';' com TimeStamp; Data Local)
+    - 'andromeda': Ficheiros brutos do concentrador Andrômeda (separados por ',')
+    """
     filename = os.path.basename(filepath).upper()
     if filename.endswith("_FALHAS.CSV"):
         return "dlq"
     try:
         with open(filepath, 'r', encoding='utf-8-sig', errors='ignore') as f:
             header = f.readline()
-            if header.startswith("PAYLOAD_JSON"):
+            header_upper = header.upper()
+            if header_upper.startswith("PAYLOAD_JSON"):
                 return "dlq"
             if ';' in header:
+                if "DATETIME" in header_upper or "SENS1 DATA1" in header_upper or "BATTERY [V]" in header_upper:
+                    return "sirius"
                 return "telix"
             return "andromeda"
     except Exception:
@@ -73,6 +83,7 @@ class FileConfigRow(ft.Container):
             options=[
                 ft.dropdown.Option("andromeda", "Andrômeda"),
                 ft.dropdown.Option("telix", "Telix"),
+                ft.dropdown.Option("sirius", "Sirius"),
                 ft.dropdown.Option("dlq", "Falhas (DLQ)")
             ],
             value=detected_source,
@@ -82,10 +93,14 @@ class FileConfigRow(ft.Container):
             content_padding=ft.padding.symmetric(horizontal=10, vertical=5)
         )
 
-        needs_config = detected_source in ("telix", "dlq")
+        needs_config = detected_source in ("telix", "sirius", "dlq")
 
         self.dd_comm = ft.Dropdown(
-            options=[ft.dropdown.Option(COMM_WIFI), ft.dropdown.Option(COMM_NBIOT)],
+            options=[
+                ft.dropdown.Option(COMM_WIFI),
+                ft.dropdown.Option(COMM_NBIOT),
+                ft.dropdown.Option(COMM_LORA)
+            ],
             value=COMM_WIFI,
             disabled=not needs_config,
             text_size=13,
@@ -119,7 +134,7 @@ class FileConfigRow(ft.Container):
 
         self.status_icon = ft.Icon(ft.icons.SCHEDULE, color=ft.colors.GREY_500, tooltip="Aguardando na fila")
 
-        # Aplica validação visual inicial (borda laranja se faltar Série)
+        # Aplica validação visual inicial (borda âmbar se faltar Série em Telix/Sirius/DLQ)
         self._apply_serial_validation_style()
 
         self.content = ft.Row([
@@ -143,7 +158,7 @@ class FileConfigRow(ft.Container):
         return True
 
     def _apply_serial_validation_style(self):
-        needs_config = self.dd_source.value in ("telix", "dlq")
+        needs_config = self.dd_source.value in ("telix", "sirius", "dlq")
         self.dd_comm.disabled = not needs_config
         self.txt_serial.disabled = not needs_config
 
@@ -167,7 +182,7 @@ class FileConfigRow(ft.Container):
         self.update()
 
     def set_comm_type(self, comm_value: str):
-        if self.dd_source.value in ("telix", "dlq"):
+        if self.dd_source.value in ("telix", "sirius", "dlq"):
             self.dd_comm.value = comm_value
             self.update()
 
@@ -251,9 +266,9 @@ def main_gui(page: ft.Page):
     page.theme_mode = ft.ThemeMode.DARK
 
     page.window_icon = "logo.png"
-    page.window_width = 1140
+    page.window_width = 1160
     page.window_height = 940
-    page.window_min_width = 1080
+    page.window_min_width = 1100
     page.window_min_height = 820
     page.padding = 16
     page.theme = ft.Theme(color_scheme_seed="#0cbda9")
@@ -343,10 +358,9 @@ def main_gui(page: ft.Page):
         time_str = datetime.now().strftime('%H:%M:%S')
         msg_upper = msg.upper()
 
-        # Escolha automática de cor semântica
-        if any(k in msg_upper for k in ("ERRO", "FALHA", "❌", "ABORTADO", "INACESSÍVEL")):
+        if any(k in msg_upper for k in ("ERRO", "FALHA", "❌", "ABORTADO", "INACESSÍVEL", "RECUSADO")):
             text_color = ft.colors.RED_300
-        elif any(k in msg_upper for k in ("⚠️", "AVISO", "CONGESTIONADA", "REDUZINDO", "ATENÇÃO", "CANCELADO")):
+        elif any(k in msg_upper for k in ("⚠️", "AVISO", "CONGESTIONADA", "REDUZINDO", "ATENÇÃO", "CANCELADO", "PAUSADA")):
             text_color = ft.colors.AMBER_300
         elif any(k in msg_upper for k in ("OK:", "✅", "BEM-SUCEDIDO", "FINALIZADA", "ESTÁVEL", "CONCLUÍDA")):
             text_color = ft.colors.GREEN_300
@@ -377,7 +391,7 @@ def main_gui(page: ft.Page):
         content=ft.Column([
             ft.Icon(ft.icons.UPLOAD_FILE_OUTLINED, size=40, color=ft.colors.GREY_600),
             ft.Text("Nenhum arquivo na fila de processamento.", size=14, color=ft.colors.GREY_400, weight=ft.FontWeight.W_500),
-            ft.Text("Clique em 'Adicionar Arquivos' para carregar planilhas do Andrômeda, Telix ou relatórios _FALHAS.csv.", size=12, color=ft.colors.GREY_600)
+            ft.Text("Clique em 'Adicionar Arquivos' para carregar planilhas do Andrômeda, Telix, Datalogger Sirius ou _FALHAS.csv.", size=12, color=ft.colors.GREY_600)
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4)
     )
 
@@ -389,7 +403,6 @@ def main_gui(page: ft.Page):
         if row_to_remove in files_list_view.controls:
             files_list_view.controls.remove(row_to_remove)
 
-        # Reaplica o efeito Zebra nas linhas restantes
         for idx, r in enumerate(file_rows):
             r.set_zebra_index(idx)
 
@@ -407,7 +420,7 @@ def main_gui(page: ft.Page):
     def set_all_comm(comm_type: str):
         count = 0
         for r in file_rows:
-            if r.dd_source.value in ("telix", "dlq"):
+            if r.dd_source.value in ("telix", "sirius", "dlq"):
                 r.set_comm_type(comm_type)
                 count += 1
         if count > 0:
@@ -425,7 +438,7 @@ def main_gui(page: ft.Page):
                     origem_detectada = detect_file_source(f.path)
                     serie_sugerida = ""
 
-                    if origem_detectada in ("telix", "dlq"):
+                    if origem_detectada in ("telix", "sirius", "dlq"):
                         serie_sugerida = guess_serial_from_filename(f.path)
                         if serie_sugerida:
                             auto_filled += 1
@@ -451,7 +464,7 @@ def main_gui(page: ft.Page):
             if auto_filled > 0:
                 add_log(f"ℹ️ {auto_filled} Nº(s) de série identificado(s) automaticamente pelo nome do arquivo.")
             if manual_needed > 0:
-                add_log(f"⚠️ Atenção: {manual_needed} arquivo(s) com nome personalizado (ex: DL-XX). Preencha o campo 'Série' destacado em amarelo.")
+                add_log(f"⚠️ Atenção: {manual_needed} arquivo(s) sem série no nome (ex: default_ ou DL-XX). Preencha o campo 'Nº de Série' destacado em amarelo.")
             page.update()
 
     file_picker = ft.FilePicker(on_result=on_files_picked)
@@ -588,11 +601,14 @@ def main_gui(page: ft.Page):
                     ], spacing=8),
                     ft.Row([
                         ft.OutlinedButton("Todos WiFi", icon=ft.icons.WIFI, height=36,
-                                          tooltip="Definir rede WiFi para todos os arquivos Telix/DLQ",
+                                          tooltip="Definir rede WiFi para todos os arquivos Telix/Sirius/DLQ",
                                           on_click=lambda _: set_all_comm(COMM_WIFI)),
                         ft.OutlinedButton("Todos NB-IoT", icon=ft.icons.CELL_TOWER, height=36,
-                                          tooltip="Definir rede NB-IoT para todos os arquivos Telix/DLQ",
+                                          tooltip="Definir rede NB-IoT para todos os arquivos Telix/Sirius/DLQ",
                                           on_click=lambda _: set_all_comm(COMM_NBIOT)),
+                        ft.OutlinedButton("Todos LoRa", icon=ft.icons.SETTINGS_INPUT_ANTENNA, height=36,
+                                          tooltip="Definir rede LoRa (SiriusLora) para todos os arquivos Telix/Sirius/DLQ",
+                                          on_click=lambda _: set_all_comm(COMM_LORA)),
                         ft.ElevatedButton("Limpar Fila", icon=ft.icons.DELETE_SWEEP, height=36, color=ft.colors.RED_300,
                                           on_click=clear_queue),
                         ft.FilledTonalButton("Adicionar Arquivos", icon=ft.icons.ADD_BOX, height=36,
@@ -664,9 +680,9 @@ def main_gui(page: ft.Page):
         close_success_dlg(e)
 
     success_dlg = ft.AlertDialog(
-        title=ft.Text("Sincronização Concluída!", weight=ft.FontWeight.BOLD),
+        title=ft.Text("Processamento Finalizado!", weight=ft.FontWeight.BOLD),
         content=ft.Text(
-            "O lote de arquivos foi processado. Verifique os relatórios para detalhes sobre eventuais falhas de conexão."),
+            "A fila de arquivos foi processada. Verifique o status na tabela e os relatórios na pasta /logs para detalhes."),
         actions=[
             ft.TextButton("Abrir Pasta de Relatórios", on_click=open_logs_and_close, icon=ft.icons.FOLDER_OPEN,
                           icon_color=ft.colors.PRIMARY),
@@ -708,13 +724,13 @@ def main_gui(page: ft.Page):
             base_check = os.path.splitext(os.path.basename(config["path"]))[0]
 
             is_andromeda_dlq = config["source"] == "dlq" and base_check.lower().startswith("siriuslora")
-            if config["source"] in ("telix", "dlq") and not config["serial"] and not is_andromeda_dlq:
+            if config["source"] in ("telix", "sirius", "dlq") and not config["serial"] and not is_andromeda_dlq:
                 add_log(f"⚠️ AVISO: Arquivo ignorado: {os.path.basename(config['path'])} (Nº de Série não preenchido)")
                 row.set_status("error", "Série pendente")
                 continue
 
             row.set_status("processing")
-            add_log(f"> Processando arquivo: {os.path.basename(config['path'])}")
+            add_log(f"> Processando arquivo: {os.path.basename(config['path'])} (Origem: {config['source'].upper()})")
 
             progress_bar.value = 0
             progress_bar.visible = True
@@ -752,7 +768,7 @@ def main_gui(page: ft.Page):
                 add_log(
                     f"❌ ERRO: O arquivo {os.path.basename(config['path'])} está aberto no Excel ou outro programa. Feche-o e tente novamente.")
             except Exception as ex:
-                row.set_status("error", "Falha interna")
+                row.set_status("error", str(ex))
                 add_log(f"❌ ERRO em {os.path.basename(config['path'])}: {str(ex)}")
 
             refresh_kpis()

@@ -100,22 +100,28 @@ def _format_eta(seconds: float) -> str:
 # ==========================================
 async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=None, progress_callback=None,
                                  log_callback=None):
+    total_payloads = len(payloads)
+    if total_payloads == 0:
+        raise ValueError("Nenhum pacote de telemetria válido encontrado no arquivo após o ETL.")
+
     url = f"{host.strip().rstrip('/')}/api/v1/{token}/telemetry"
     start_index = _get_checkpoint(file_path)
-    total_payloads = len(payloads)
 
     if start_index >= total_payloads:
         if log_callback:
-            log_callback("Arquivo já processado na totalidade. Ignorando injeção.")
+            log_callback("ℹ️ Arquivo já consta como 100% processado no Checkpoint. Ignorando injeção.")
         return
 
-    # Ajuste da Marcha Inicial
+    # 1. Ajuste da Marcha Inicial
     if total_payloads < 1500:
         current_eps = 20.0
     elif total_payloads < 5000:
         current_eps = 15.0
     else:
         current_eps = 8.0
+
+    if start_index > 0 and log_callback:
+        log_callback(f"🔄 Retomando do Checkpoint: linha {start_index + 1} de {total_payloads}.")
 
     if log_callback:
         log_callback(f"[{token}] Carga de {total_payloads} pacotes. EPS Inicial: {current_eps} req/seg.")
@@ -128,13 +134,15 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
     MAX_EPS = 25.0
     MIN_EPS = 2.0
     timeout = aiohttp.ClientTimeout(total=30)
+    token_error_message = None
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for current_idx in range(start_index, total_payloads):
 
             if cancel_token and cancel_token.cancelled:
+                _manage_checkpoint(file_path, current_idx)
                 if log_callback:
-                    log_callback("⚠️ Injeção abortada pelo usuário. Checkpoint salvo.")
+                    log_callback(f"⚠️ Injeção pausada pelo usuário. Checkpoint salvo na posição {current_idx}.")
                 break
 
             cycle_start = time.time()
@@ -157,14 +165,12 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
 
                             break
 
-                        # Se retornar 401 (Unauthorized) ou 404 (Not Found), o token está errado no ThingsBoard
+                        # Token recusado pelo ThingsBoard (401 Unauthorized / 404 Not Found)
                         elif response.status in [401, 404]:
-                            err_msg = f"HTTP_{response.status} (Token inválido ou dispositivo não cadastrado)"
-                            if log_callback:
-                                log_callback(
-                                    f"❌ ERRO CRÍTICO: Servidor recusou o Token '{token}' ({err_msg}). Abortando arquivo.")
-                            _write_to_dlq(file_path, payload, err_msg)
-                            erros += 1
+                            token_error_message = (
+                                f"Token '{token}' recusado pelo servidor (HTTP {response.status}). "
+                                f"Verifique se a Rede (WiFi/NB-IoT/LoRa) ou Nº de Série estão corretos."
+                            )
                             abort_file = True
                             break
 
@@ -174,7 +180,8 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
 
                             if log_callback and attempt == 0:
                                 log_callback(
-                                    f"⚠️ Rule Chain congestionada (HTTP {response.status}). Reduzindo para {current_eps} EPS.")
+                                    f"⚠️ Rule Chain congestionada (HTTP {response.status}). Reduzindo para {current_eps} EPS."
+                                )
 
                             if attempt < retries - 1:
                                 await asyncio.sleep(5.0)
@@ -203,7 +210,7 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
             if abort_file:
                 break
 
-            # Cálculo de ETA para a interface
+            # Atualiza barra de progresso e ETA a cada 10 envios ou no último pacote
             if progress_callback and ((current_idx + 1) % 10 == 0 or (current_idx + 1) == total_payloads):
                 processed_count = (current_idx + 1) - start_index
                 elapsed_total = time.time() - start_time
@@ -224,6 +231,11 @@ async def inject_telemetry_async(payloads, token, host, file_path, cancel_token=
             if elapsed < min_cycle_time:
                 await asyncio.sleep(min_cycle_time - elapsed)
 
+    # Se abortou por Token inválido, não apaga eventual checkpoint anterior e dispara erro para a UI ficar vermelha
+    if token_error_message:
+        raise ValueError(token_error_message)
+
+    # Se concluiu todos os pacotes sem ser cancelado, limpa o checkpoint e gera o relatório final
     if not (cancel_token and cancel_token.cancelled):
         _manage_checkpoint(file_path, clear=True)
         report_path = _generate_report(file_path, (sucessos + erros), sucessos, erros, start_time, host)
