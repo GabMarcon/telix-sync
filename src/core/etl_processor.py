@@ -120,7 +120,9 @@ def _extract_dlq_payloads(file_path: str, max_rows: int = None) -> list:
 def process_data(file_path: str, source_type: str, comm_type: str = None, serial: str = None):
     """
     Roteia o processamento com base na origem ('andromeda', 'telix', 'sirius' ou 'dlq').
-    Retorna a lista de payloads estruturada e o Token de acesso gerado.
+    Aplica o filtro de qualidade ANTES de salvar o CSV convertido para que a planilha
+    gerada reflita exatamente os dados limpos enviados ao Telix.
+    Retorna: (payloads, token, discarded_count, discarded_filename)
     """
     try:
         nome_arquivo = os.path.basename(file_path)
@@ -130,7 +132,7 @@ def process_data(file_path: str, source_type: str, comm_type: str = None, serial
         if source_type == "dlq":
             payloads = _extract_dlq_payloads(file_path)
             log.info(f"Origem DLQ (Reprocessamento). {len(payloads)} pacotes recuperados para o token: {token}")
-            return payloads, token
+            return payloads, token, 0, None
 
         # 2. Rota Concentrador Andrômeda
         elif source_type == "andromeda":
@@ -140,32 +142,35 @@ def process_data(file_path: str, source_type: str, comm_type: str = None, serial
 
         # 3. Rota Datalogger Sirius (Memória Interna)
         elif source_type == "sirius":
-            # index_col=False é crucial pois o datalogger Sirius adiciona um ';' extra no fim de cada linha
             df_raw = pd.read_csv(file_path, sep=';', encoding='utf-8-sig', dtype=str, header=0, index_col=False)
             df = _apply_sirius_etl_rules(df_raw, nome_arquivo)
-
-            output_dir = os.path.dirname(file_path)
-            output_filename = f"convertido_{token}_{nome_arquivo}"
-
-            df_para_salvar = df.drop(columns=['ts'], errors='ignore')
-            df_para_salvar.to_csv(os.path.join(output_dir, output_filename), index=False, sep=',', encoding='utf-8')
-
-            log.info(f"Origem Sirius (Datalogger). ETL aplicado e arquivo convertido salvo. Token gerado: {token}")
 
         # 4. Rota Plataforma Telix
         else:
             df_raw = pd.read_csv(file_path, sep=';', encoding='utf-8-sig', dtype=str, header=0, index_col=False)
             df = _apply_telix_etl_rules(df_raw, nome_arquivo)
 
+        # Aplica o filtro de qualidade e limpa o DataFrame (df_clean) ANTES de salvar o CSV convertido
+        payloads, discarded_records, df_clean = _validate_and_build_payloads(df)
+
+        if source_type in ("sirius", "telix"):
             output_dir = os.path.dirname(file_path)
             output_filename = f"convertido_{token}_{nome_arquivo}"
 
-            df_para_salvar = df.drop(columns=['ts'], errors='ignore')
+            df_para_salvar = df_clean.drop(columns=['ts'], errors='ignore')
             df_para_salvar.to_csv(os.path.join(output_dir, output_filename), index=False, sep=',', encoding='utf-8')
+            log.info(f"Origem {source_type.capitalize()}. ETL e Filtro aplicados; arquivo convertido limpo salvo. Token: {token}")
 
-            log.info(f"Origem Telix. ETL aplicado e arquivo convertido salvo. Token gerado: {token}")
+        disc_filename = None
+        if discarded_records:
+            disc_path = _save_discarded_records(file_path, token, discarded_records)
+            disc_filename = os.path.basename(disc_path)
+            log.warning(
+                f"[{token}] Filtro de Qualidade: {len(discarded_records)} leitura(s) de canais "
+                f"descartada(s). Auditoria salva em: {disc_filename}"
+            )
 
-        return _validate_and_build_payloads(df), token
+        return payloads, token, len(discarded_records), disc_filename
 
     except Exception as e:
         log.error(f"Erro no ETL ({os.path.basename(file_path)}): {str(e)}")
@@ -174,7 +179,7 @@ def process_data(file_path: str, source_type: str, comm_type: str = None, serial
 
 def preview_data(file_path: str, source_type: str, comm_type: str = None, serial: str = None):
     """
-    Executa um Dry-Run nas 3 primeiras linhas para visualização do Payload na interface (sem salvar arquivos).
+    Executa um Dry-Run para visualização dos 3 primeiros Payloads válidos na interface (sem salvar arquivos).
     """
     try:
         nome_arquivo = os.path.basename(file_path)
@@ -182,16 +187,17 @@ def preview_data(file_path: str, source_type: str, comm_type: str = None, serial
         if source_type == "dlq":
             return _extract_dlq_payloads(file_path, max_rows=3)
         elif source_type == "andromeda":
-            df = pd.read_csv(file_path, sep=',', encoding='utf-8', nrows=3)
+            df = pd.read_csv(file_path, sep=',', encoding='utf-8', nrows=500)
             df = _convert_dates_to_ts(df)
         elif source_type == "sirius":
-            df_raw = pd.read_csv(file_path, sep=';', encoding='utf-8-sig', dtype=str, header=0, nrows=3, index_col=False)
+            df_raw = pd.read_csv(file_path, sep=';', encoding='utf-8-sig', dtype=str, header=0, nrows=500, index_col=False)
             df = _apply_sirius_etl_rules(df_raw, nome_arquivo)
         else:
-            df_raw = pd.read_csv(file_path, sep=';', encoding='utf-8-sig', dtype=str, header=0, nrows=3, index_col=False)
+            df_raw = pd.read_csv(file_path, sep=';', encoding='utf-8-sig', dtype=str, header=0, nrows=500, index_col=False)
             df = _apply_telix_etl_rules(df_raw, nome_arquivo)
 
-        return _validate_and_build_payloads(df)
+        payloads, _, _ = _validate_and_build_payloads(df)
+        return payloads[:3]
 
     except Exception as e:
         log.error(f"Erro ao gerar preview de {os.path.basename(file_path)}: {str(e)}")
@@ -308,54 +314,162 @@ def _apply_sirius_etl_rules(df: pd.DataFrame, nome_arquivo: str) -> pd.DataFrame
     return df_saida
 
 
-def _validate_and_build_payloads(df: pd.DataFrame) -> list:
+def _map_channel_profiles(df: pd.DataFrame) -> dict:
     """
-    Monta a lista de pacotes JSON garantindo que as chaves da API (timeseries)
-    sejam exatamente as exigidas pela Rule Chain do Telix.
+    Analisa o DataFrame completo para identificar quais canais estão em uso (possuem
+    dados em sXd1) e quais canais utilizam o segundo dado (possuem dados válidos e >= 0 em sXd2).
+    """
+    profiles = {}
+    for ch in range(1, 5):
+        col_d1 = f"s{ch}d1"
+        col_d2 = f"s{ch}d2"
+
+        has_d1 = False
+        has_d2 = False
+
+        if col_d1 in df.columns:
+            s_d1 = pd.to_numeric(
+                df[col_d1].astype(str).str.replace(',', '.').str.strip(),
+                errors='coerce'
+            )
+            has_d1 = bool(s_d1.notna().any())
+
+        if col_d2 in df.columns:
+            s_d2 = pd.to_numeric(
+                df[col_d2].astype(str).str.replace(',', '.').str.strip(),
+                errors='coerce'
+            )
+            # Considera que o canal possui 2º dado ativo se houver pelo menos uma leitura válida e não-negativa
+            has_d2 = bool((s_d2.notna() & (s_d2 >= 0)).any())
+
+        profiles[ch] = {
+            "active": has_d1 or has_d2,
+            "has_d1": has_d1,
+            "has_d2": has_d2
+        }
+
+    return profiles
+
+
+def _save_discarded_records(original_filepath: str, token: str, discarded_records: list) -> str:
+    """
+    Salva um relatório CSV de auditoria contendo todas as leituras de canais descartadas
+    pelas regras de qualidade (dado primário vazio, dado secundário negativo ou ausente).
+    """
+    output_dir = os.path.dirname(original_filepath)
+    base_name = os.path.splitext(os.path.basename(original_filepath))[0]
+
+    prefix = f"convertido_{token}_"
+    if base_name.lower().startswith(prefix.lower()):
+        clean_base = base_name
+    else:
+        clean_base = f"convertido_{token}_{base_name}"
+
+    out_filename = f"{clean_base}_DESCARTADOS.csv"
+    out_path = os.path.join(output_dir, out_filename)
+
+    df_disc = pd.DataFrame(discarded_records)
+    df_disc.to_csv(out_path, index=False, sep=';', encoding='utf-8-sig')
+    return out_path
+
+
+def _validate_and_build_payloads(df: pd.DataFrame) -> tuple:
+    """
+    Monta a lista de pacotes JSON aplicando o filtro inteligente por canal e também
+    limpa os canais descartados diretamente em uma cópia do DataFrame (df_clean).
+    Retorna: (valid_payloads, discarded_records, df_clean)
     """
     if df.empty:
-        return []
+        return [], [], df.copy()
 
+    df_clean = df.copy()
     valid_payloads = []
+    discarded_records = []
+    channel_profiles = _map_channel_profiles(df_clean)
 
     def to_float(val):
         try:
             if pd.isna(val):
                 return None
-            s = str(val).strip()
+            s = str(val).strip().replace(',', '.')
             if s == '' or s.lower() == 'nan':
                 return None
             return float(s)
         except Exception:
             return None
 
-    for row_dict in df.to_dict(orient='records'):
-        if 'ts' not in row_dict or pd.isna(row_dict['ts']):
+    for idx, row in df_clean.iterrows():
+        if 'ts' not in row or pd.isna(row['ts']):
             continue
 
-        ts_val = int(row_dict['ts'])
+        ts_val = int(row['ts'])
+        data_hora_str = str(row.get('Data/Hora', ''))
         values = {}
 
-        for s in ('s1d1', 's1d2', 's2d1', 's2d2', 's3d1', 's3d2', 's4d1', 's4d2'):
-            val = to_float(row_dict.get(s))
-            if val is not None:
-                values[s] = val
+        for ch in range(1, 5):
+            prof = channel_profiles[ch]
+            if not prof["active"]:
+                continue
 
-        vbat = to_float(row_dict.get('Bateria (V)'))
+            col_d1 = f"s{ch}d1"
+            col_d2 = f"s{ch}d2"
+
+            raw_d1 = row.get(col_d1, '')
+            raw_d2 = row.get(col_d2, '')
+
+            val_d1 = to_float(raw_d1)
+            val_d2 = to_float(raw_d2)
+
+            motivo_descarte = None
+
+            # Regra 1: Primeiro dado (sXd1) vazio
+            if val_d1 is None:
+                motivo_descarte = f"Dado primario ({col_d1}) vazio ou invalido"
+
+            # Regra 2: Segundo dado (sXd2) negativo (ex: temperatura negativa)
+            elif val_d2 is not None and val_d2 < 0:
+                motivo_descarte = f"Segundo dado ({col_d2}) negativo ({val_d2})"
+
+            # Regra 3: Segundo dado (sXd2) vazio em canal que exige segundo dado
+            elif prof["has_d2"] and val_d2 is None:
+                motivo_descarte = f"Segundo dado ({col_d2}) vazio em canal duplo"
+
+            if motivo_descarte:
+                discarded_records.append({
+                    "Data/Hora": data_hora_str,
+                    "Timestamp (ms)": ts_val,
+                    "Canal": f"Canal {ch}",
+                    "Colunas Afetadas": f"{col_d1} / {col_d2}",
+                    "Valor Primario (d1)": '' if pd.isna(raw_d1) else str(raw_d1).strip(),
+                    "Valor Secundario (d2)": '' if pd.isna(raw_d2) else str(raw_d2).strip(),
+                    "Motivo do Descarte": motivo_descarte
+                })
+                # Apaga os valores espúrios diretamente no DataFrame que será salvo no CSV convertido!
+                if col_d1 in df_clean.columns:
+                    df_clean.at[idx, col_d1] = ''
+                if col_d2 in df_clean.columns:
+                    df_clean.at[idx, col_d2] = ''
+                continue
+
+            values[col_d1] = val_d1
+            if val_d2 is not None:
+                values[col_d2] = val_d2
+
+        vbat = to_float(row.get('Bateria (V)'))
         if vbat is not None:
             values['vbat'] = vbat
 
-        lbat_str = str(row_dict.get('Bat Fraca', '')).strip().lower()
+        lbat_str = str(row.get('Bat Fraca', '')).strip().lower()
         if lbat_str == 'true':
             values['lbat'] = True
         elif lbat_str == 'false':
             values['lbat'] = False
 
-        rssi = to_float(row_dict.get('RSSI'))
+        rssi = to_float(row.get('RSSI'))
         if rssi is not None:
             values['rssi'] = rssi
 
-        snr = to_float(row_dict.get('SNR'))
+        snr = to_float(row.get('SNR'))
         if snr is not None:
             values['snr'] = snr
 
@@ -365,4 +479,4 @@ def _validate_and_build_payloads(df: pd.DataFrame) -> list:
                 "values": values
             })
 
-    return valid_payloads
+    return valid_payloads, discarded_records, df_clean

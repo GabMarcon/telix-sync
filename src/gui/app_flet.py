@@ -10,7 +10,7 @@ from src.core.tb_injector import inject_telemetry_async
 from src.core.logger import get_logger
 
 # Definição global da versão do software
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 log = get_logger()
 
@@ -121,7 +121,7 @@ class FileConfigRow(ft.Container):
         self.btn_preview = ft.IconButton(
             icon=ft.icons.MANAGE_SEARCH,
             icon_color=ft.colors.PRIMARY,
-            tooltip="Pré-visualizar Payload (Dry Run)",
+            tooltip="Pré-visualizar Payload (Dry Run com Filtro de Qualidade)",
             on_click=self.show_preview
         )
 
@@ -213,7 +213,10 @@ class FileConfigRow(ft.Container):
             content=ft.Container(
                 content=ft.Column([
                     ft.Text(f"Arquivo: {self.filename}", italic=True),
-                    ft.Text("Visualizando apenas as 3 primeiras linhas como JSON puro:", color=ft.colors.GREY_400),
+                    ft.Text(
+                        "Visualizando os 3 primeiros pacotes válidos após o filtro de qualidade:",
+                        color=ft.colors.GREY_400
+                    ),
                     ft.TextField(
                         value=payload_str,
                         multiline=True,
@@ -246,7 +249,7 @@ class FileConfigRow(ft.Container):
         elif status == "success":
             self.status_icon.name = ft.icons.CHECK_CIRCLE
             self.status_icon.color = ft.colors.GREEN_400
-            self.status_icon.tooltip = "Concluído com sucesso"
+            self.status_icon.tooltip = tooltip or "Concluído com sucesso"
             self.btn_delete.disabled = False
         elif status == "error":
             self.status_icon.name = ft.icons.ERROR
@@ -360,7 +363,7 @@ def main_gui(page: ft.Page):
 
         if any(k in msg_upper for k in ("ERRO", "FALHA", "❌", "ABORTADO", "INACESSÍVEL", "RECUSADO")):
             text_color = ft.colors.RED_300
-        elif any(k in msg_upper for k in ("⚠️", "AVISO", "CONGESTIONADA", "REDUZINDO", "ATENÇÃO", "CANCELADO", "PAUSADA")):
+        elif any(k in msg_upper for k in ("⚠️", "AVISO", "CONGESTIONADA", "REDUZINDO", "ATENÇÃO", "CANCELADO", "PAUSADA", "DESCARTAD", "FILTRO")):
             text_color = ft.colors.AMBER_300
         elif any(k in msg_upper for k in ("OK:", "✅", "BEM-SUCEDIDO", "FINALIZADA", "ESTÁVEL", "CONCLUÍDA")):
             text_color = ft.colors.GREEN_300
@@ -433,6 +436,11 @@ def main_gui(page: ft.Page):
             manual_needed = 0
 
             for f in e.files:
+                # Proteção: impede que relatórios _DESCARTADOS.csv sejam inseridos na fila como telemetria
+                if f.name.upper().endswith("_DESCARTADOS.CSV"):
+                    add_log(f"⚠️ Ignorado: '{f.name}' é um relatório de auditoria de descartes e não deve ser reinserido.")
+                    continue
+
                 if f.path not in existing_paths:
                     linhas = count_file_lines(f.path)
                     origem_detectada = detect_file_source(f.path)
@@ -682,7 +690,7 @@ def main_gui(page: ft.Page):
     success_dlg = ft.AlertDialog(
         title=ft.Text("Processamento Finalizado!", weight=ft.FontWeight.BOLD),
         content=ft.Text(
-            "A fila de arquivos foi processada. Verifique o status na tabela e os relatórios na pasta /logs para detalhes."),
+            "A fila de arquivos foi processada. Verifique o status na tabela, eventuais arquivos _DESCARTADOS.csv e os relatórios na pasta /logs para detalhes."),
         actions=[
             ft.TextButton("Abrir Pasta de Relatórios", on_click=open_logs_and_close, icon=ft.icons.FOLDER_OPEN,
                           icon_color=ft.colors.PRIMARY),
@@ -734,18 +742,31 @@ def main_gui(page: ft.Page):
 
             progress_bar.value = 0
             progress_bar.visible = True
-            progress_text.value = "Executando ETL e preparando pacotes JSON..."
+            progress_text.value = "Executando ETL, aplicando filtro de qualidade e preparando pacotes JSON..."
             progress_text.visible = True
             page.update()
 
             try:
-                payloads, token = await asyncio.to_thread(
+                etl_result = await asyncio.to_thread(
                     process_data,
                     config["path"],
                     config["source"],
                     config["comm"],
                     config["serial"]
                 )
+
+                # Suporta retorno de 4 valores (com auditoria de descartes) ou 2 valores (retrocompatibilidade)
+                if len(etl_result) == 4:
+                    payloads, token, discarded_count, disc_filename = etl_result
+                else:
+                    payloads, token = etl_result
+                    discarded_count, disc_filename = 0, None
+
+                if discarded_count > 0:
+                    add_log(
+                        f"⚠️ Filtro de Qualidade [{token}]: {discarded_count} leitura(s) espúria(s) ou vazia(s) "
+                        f"descartada(s). Salvo em: {disc_filename}"
+                    )
 
                 await inject_telemetry_async(
                     payloads=payloads,
@@ -760,7 +781,11 @@ def main_gui(page: ft.Page):
                 if cancel_token.cancelled:
                     row.set_status("cancelled")
                 else:
-                    row.set_status("success")
+                    tooltip_msg = (
+                        f"Concluído ({discarded_count} leitura(s) espúria(s) filtrada(s))"
+                        if discarded_count > 0 else "Concluído com sucesso"
+                    )
+                    row.set_status("success", tooltip=tooltip_msg)
                     add_log(f"OK: Arquivo {os.path.basename(config['path'])} sincronizado com sucesso.")
 
             except PermissionError:

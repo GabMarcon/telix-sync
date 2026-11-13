@@ -1,10 +1,11 @@
-# Telix Sync (v1.3.0)
+# Telix Sync (v1.4.0)
 
 O **Telix Sync** é uma ferramenta desktop desenvolvida pela Auro Tecnologia para a injeção e ressincronização de telemetria em massa na plataforma Telix (ThingsBoard). O software processa arquivos brutos originados do concentrador Andrômeda, planilhas exportadas da plataforma Telix, arquivos extraídos diretamente da memória do datalogger Sirius e relatórios de falhas (DLQ), inserindo os dados via HTTP assíncrono de alta performance.
 
 ## Funcionalidades Principais
 
 * **Detecção e ETL Automáticos (4 Fontes):** Reconhecimento automático se o arquivo tem origem **Andrômeda**, **Telix**, **Sirius (Datalogger)** ou **Falhas (DLQ)**. Para arquivos do Telix e Sirius, aplica as regras de Extração, Transformação e Carga (ETL) gerando um arquivo `.csv` convertido estruturalmente idêntico ao padrão do concentrador Andrômeda e corrigindo nativamente o fuso horário (`America/Sao_Paulo`) para Epoch (`ts`).
+* **Filtro Inteligente de Qualidade e Auditoria (`_DESCARTADOS.csv`):** Analisa automaticamente o perfil de cada um dos 4 canais do datalogger (`s1` a `s4`), diferenciando sensores simples (`sXd1`), sensores duplos (`sXd1` + `sXd2`) e canais desconectados. Descarta integralmente a leitura do canal caso o dado primário esteja vazio, o dado secundário seja negativo (ex: erro de temperatura em corda vibrante) ou o dado secundário venha vazio em um canal duplo, limpando o CSV convertido e gerando um relatório de auditoria detalhado (`_DESCARTADOS.csv`) para evitar disparos de alarmes falsos na plataforma.
 * **Suporte Completo às 3 Redes (WiFi, NB-IoT e LoRa):** Gera automaticamente os tokens e nomes de arquivos convertidos respeitando a arquitetura de transmissão selecionada:
   * **WiFi:** `Sirius` + Nº de Série (ex: `Sirius727`)
   * **NB-IoT:** `00` + Nº de Série (ex: `00727`)
@@ -15,7 +16,7 @@ O **Telix Sync** é uma ferramenta desktop desenvolvida pela Auro Tecnologia par
 * **Marcha Adaptativa (Adaptive EPS) e Painel de KPIs:** Motor inteligente que calibra a velocidade (`Requisições por Segundo`) com base na saúde da *Rule Chain* do servidor, exibindo em tempo real cards de indicadores com arquivos concluídos, volume de linhas, velocidade instantânea (`EPS`) e estimativa de tempo restante (`ETA`).
 * **Ações em Lote na Fila:** Botões rápidos (**Todos WiFi**, **Todos NB-IoT** e **Todos LoRa**) para alterar o tipo de comunicação de múltiplos arquivos simultaneamente, além de proteção contra arquivos duplicados.
 * **Resiliência e Checkpoints:** Acompanha o processamento linha a linha e salva o progresso em `.telix_checkpoints.json`. Se o processo for interrompido ou pausado manualmente, retoma exatamente de onde parou no próximo início.
-* **Dry Run (Pré-visualização JSON) e Terminal Semântico:** Validador visual das 3 primeiras linhas do Payload JSON antes do envio e terminal de diagnóstico colorido por criticidade (Sucesso, Aviso, Erro).
+* **Dry Run (Pré-visualização JSON) e Terminal Semântico:** Validador visual das 3 primeiras linhas válidas do Payload JSON (já com o filtro de qualidade aplicado) antes do envio e terminal de diagnóstico colorido por criticidade (Sucesso, Aviso, Erro).
 * **Proteção contra Bloqueios (Anti-Excel):** Intercepta de forma amigável arquivos que estejam abertos/bloqueados no Microsoft Excel, evitando travamentos.
 
 ---
@@ -37,13 +38,14 @@ O Telix Sync foi projetado para ser executado como uma aplicação *Standalone* 
 3. **Arquivos Telix, Sirius (Datalogger) ou Falhas (DLQ):**
    * Defina a **Rede** (`WiFi`, `NB-IoT` ou `LoRa`) individualmente ou use os botões **Todos WiFi** / **Todos NB-IoT** / **Todos LoRa** no topo da tabela.
    * Confira o **Nº de Série** preenchido automaticamente (ou digite manualmente nos campos destacados em amarelo para arquivos `default_...` ou nomes customizados).
-4. *(Opcional)* Clique no ícone de lupa na coluna **JSON** para pré-visualizar os pacotes antes do envio.
+4. *(Opcional)* Clique no ícone de lupa na coluna **JSON** para pré-visualizar os pacotes válidos antes do envio.
 
-### Passo 3: Iniciar Sincronização
+### Passo 3: Iniciar Sincronização e Auditoria
 1. Clique em **Iniciar Sincronização em Massa**.
 2. Acompanhe o andamento pelos **Cards de KPIs** no topo (Velocidade e ETA), pela barra de progresso e pelo **Terminal de Execução**.
-3. Caso precise interromper o envio, clique em **Parada Segura (Salvar Checkpoint)**.
-4. Ao finalizar, consulte os relatórios detalhados na pasta `/logs` clicando em **Abrir Pasta de Relatórios**.
+3. Caso o **Filtro de Qualidade** detecte leituras espúrias ou vazias, um alerta amarelo será exibido no terminal e um arquivo `_DESCARTADOS.csv` será salvo na mesma pasta da planilha original com o detalhamento de cada descarte.
+4. Caso precise interromper o envio, clique em **Parada Segura (Salvar Checkpoint)**.
+5. Ao finalizar, consulte os relatórios detalhados na pasta `/logs` clicando em **Abrir Pasta de Relatórios**.
 
 ---
 
@@ -57,13 +59,22 @@ Garanta que seu ambiente virtual (`venv`) está ativo e que as dependências do 
 **Comando de Build:**
 Execute o comando abaixo no terminal, na raiz do projeto, para gerar o executável atualizado na pasta `dist/`:
 
-```bash
-flet pack main.py --name "TelixSync" --icon "assets\logo.png" --add-data "assets;assets"
-```
+`flet pack main.py --name "TelixSync" --icon "assets\logo.png" --add-data "assets;assets"`
 
 ---
 
 ## Changelog (Histórico de Versões)
+
+### [v1.4.0] - 2026-11-13
+#### Adicionado
+* **Filtro Inteligente de Qualidade por Canal:** Mapeamento automático do perfil de cada canal (`s1` a `s4`) na planilha para identificar canais ativos e canais duplos (`sXd1` + `sXd2`), ignorando silenciosamente canais desconectados.
+* **Descarte Integral de Leituras Espúrias:** Bloqueio automático de todo o canal na linha caso o dado primário (`sXd1`) esteja vazio, o dado secundário (`sXd2`) apresente valor negativo (`< 0`, como falhas de temperatura em sensores de corda vibrante) ou o dado secundário venha vazio em um canal mapeado como duplo, prevenindo o disparo em massa de alarmes falsos na Rule Chain do Telix.
+* **Relatório de Auditoria (`_DESCARTADOS.csv`):** Geração automática de planilha de auditoria contendo `Data/Hora`, `Timestamp`, `Canal`, `Colunas Afetadas`, valores originais e o motivo exato de cada descarte, acompanhada de alertas visuais no terminal semântico da interface e proteção contra reinserção acidental do relatório na fila.
+
+#### Corrigido
+* **Higienização do CSV Convertido:** Aplicação do filtro de qualidade diretamente no DataFrame antes da exportação do arquivo `convertido_...csv`, garantindo que tanto a planilha salva em disco quanto os pacotes JSON injetados via API estejam 100% livres de leituras espúrias.
+
+---
 
 ### [v1.3.0] - 2026-10-29
 #### Adicionado
